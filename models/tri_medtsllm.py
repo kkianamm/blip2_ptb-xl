@@ -28,12 +28,12 @@ from .tri_components import (
 
 
 class TriMedTsLLM(MedTsLLM):
-    """Unified classifier with independently switchable MOMENT and BioMedCoOp.
+    """Unified sequence classifier using all three requested enhancements.
 
     Data path::
 
         MedTsLLM tokens -----\\
-                              gated fusion -> Q-Former -> LLM -> output head
+                              gated fusion -> Q-Former -> LLM -> BioMedCoOp
         MOMENT tokens -------/
     """
 
@@ -50,6 +50,11 @@ class TriMedTsLLM(MedTsLLM):
             raise ValueError(
                 "Missing [models.medtsllm.combined] in the TOML configuration."
             )
+        if not self.use_biomedcoop or not hasattr(self, "bc_head"):
+            raise ValueError(
+                "TriMedTsLLM requires the BioMedCoOp head already implemented in "
+                "medtsllm4. Enable [models.medtsllm.biomedcoop].enabled."
+            )
         if not self.llm_enabled:
             raise ValueError("TriMedTsLLM requires models.medtsllm.llm.enabled=true.")
 
@@ -60,34 +65,26 @@ class TriMedTsLLM(MedTsLLM):
         dropout = float(cfg_get(combined, "dropout", 0.1))
 
         moment_cfg = cfg_get(combined, "moment", {})
-        self.use_moment = bool(cfg_get(moment_cfg, "enabled", True))
         self.use_highres_windows = bool(
             cfg_get(moment_cfg, "use_highres_windows", True)
         )
         self.save_frozen_moment = bool(
             cfg_get(moment_cfg, "save_frozen_backbone", False)
         )
-
-        self.moment_encoder: Optional[MomentTokenEncoder] = None
-        if self.use_moment:
-            self.moment_encoder = MomentTokenEncoder(
-                input_channels=int(self.n_features),
-                token_dim=q_dim,
-                model_id=str(
-                    cfg_get(moment_cfg, "model_id", "AutonLab/MOMENT-1-base")
-                ),
-                backend=str(cfg_get(moment_cfg, "backend", "moment")),
-                freeze_backbone=bool(cfg_get(moment_cfg, "freeze", True)),
-                trust_remote_code=bool(
-                    cfg_get(moment_cfg, "trust_remote_code", True)
-                ),
-                allow_local_fallback=bool(
-                    cfg_get(moment_cfg, "allow_local_fallback", False)
-                ),
-                local_patch_size=int(cfg_get(moment_cfg, "local_patch_size", 16)),
-                max_leads=int(cfg_get(moment_cfg, "max_leads", 64)),
-                unfreeze_last_n=int(cfg_get(moment_cfg, "unfreeze_last_n", 0)),
-            )
+        self.moment_encoder = MomentTokenEncoder(
+            input_channels=int(self.n_features),
+            token_dim=q_dim,
+            model_id=str(cfg_get(moment_cfg, "model_id", "AutonLab/MOMENT-1-base")),
+            backend=str(cfg_get(moment_cfg, "backend", "moment")),
+            freeze_backbone=bool(cfg_get(moment_cfg, "freeze", True)),
+            trust_remote_code=bool(cfg_get(moment_cfg, "trust_remote_code", True)),
+            allow_local_fallback=bool(
+                cfg_get(moment_cfg, "allow_local_fallback", False)
+            ),
+            local_patch_size=int(cfg_get(moment_cfg, "local_patch_size", 16)),
+            max_leads=int(cfg_get(moment_cfg, "max_leads", 64)),
+            unfreeze_last_n=int(cfg_get(moment_cfg, "unfreeze_last_n", 0)),
+        )
 
         self.med_to_q = nn.Sequential(nn.Linear(self.d_llm, q_dim), nn.LayerNorm(q_dim))
         self.fusion = GatedResidualFusion(q_dim, dropout)
@@ -111,13 +108,6 @@ class TriMedTsLLM(MedTsLLM):
         self.med_aux_head = nn.Linear(q_dim, output_dim)
         self.moment_aux_head = nn.Linear(q_dim, output_dim)
         self.query_aux_head = nn.Linear(q_dim, output_dim)
-
-        # When BioMedCoOp is ablated, use a conventional trainable classifier
-        # on the same LLM/Q-Former representation. This changes only the output
-        # head while preserving the rest of the architecture.
-        self.standard_classifier: Optional[nn.Linear] = None
-        if not self.use_biomedcoop:
-            self.standard_classifier = nn.Linear(self.d_llm, output_dim)
 
         loss_cfg = cfg_get(combined, "loss", {})
         self.loss_weights = {
@@ -192,12 +182,6 @@ class TriMedTsLLM(MedTsLLM):
                 )
             combined_cf = torch.cat([main_cf, windows_cf], dim=0)
 
-        if self.moment_encoder is None:
-            raise RuntimeError(
-                "MOMENT encoding was requested while "
-                "[models.medtsllm.combined.moment].enabled=false."
-            )
-
         all_tokens = self.moment_encoder(combined_cf).tokens
         main_tokens = all_tokens[:batch]
         if window_count == 0:
@@ -233,50 +217,32 @@ class TriMedTsLLM(MedTsLLM):
     def _set_auxiliary_losses(
         self,
         med_repr: Tensor,
-        moment_repr: Optional[Tensor],
+        moment_repr: Tensor,
         query_repr: Tensor,
         queries: Tensor,
         labels: Optional[Tensor],
     ) -> None:
         zero = query_repr.new_zeros(())
-
-        bc_aux = zero
-        if self.use_biomedcoop and hasattr(self, "bc_head"):
-            current_bc_aux = getattr(self.bc_head, "aux_loss", None)
-            if current_bc_aux is not None:
-                bc_aux = current_bc_aux
-
-        alignment_loss = zero
-        if self.use_moment and moment_repr is not None:
-            alignment_loss = supervised_contrastive_alignment(
-                med_repr, moment_repr, labels, self.alignment_temperature
-            )
-
+        bc_aux = getattr(self.bc_head, "aux_loss", None)
+        if bc_aux is None:
+            bc_aux = zero
         raw: dict[str, Tensor] = {
             "med_ce": zero,
             "moment_ce": zero,
             "query_ce": zero,
-            "alignment": alignment_loss,
+            "alignment": supervised_contrastive_alignment(
+                med_repr, moment_repr, labels, self.alignment_temperature
+            ),
             "query_diversity": query_diversity_loss(queries),
             "biomedcoop": bc_aux,
         }
-
         if labels is not None:
             raw["med_ce"] = self._branch_loss(self.med_aux_head(med_repr), labels)
-
-            if self.use_moment and moment_repr is not None:
-                raw["moment_ce"] = self._branch_loss(
-                    self.moment_aux_head(moment_repr), labels
-                )
-
-            raw["query_ce"] = self._branch_loss(
-                self.query_aux_head(query_repr), labels
+            raw["moment_ce"] = self._branch_loss(
+                self.moment_aux_head(moment_repr), labels
             )
-
-        weighted = {
-            name: value * self.loss_weights[name]
-            for name, value in raw.items()
-        }
+            raw["query_ce"] = self._branch_loss(self.query_aux_head(query_repr), labels)
+        weighted = {name: value * self.loss_weights[name] for name, value in raw.items()}
         weighted["total"] = torch.stack(tuple(weighted.values())).sum()
         self._auxiliary_losses = weighted
         self.aux_loss = weighted["total"]
@@ -297,20 +263,11 @@ class TriMedTsLLM(MedTsLLM):
         batch = x_enc.shape[0]
         med_tokens = self._restore_batch(self.encode_ts(x_enc), batch)
         med_tokens = self.med_to_q(med_tokens)
-        moment_tokens: Optional[Tensor] = None
-        gate: Optional[Tensor] = None
-
-        if self.use_moment:
-            moment_tokens = self._encode_moment(
-                x_enc, inputs.get("x_moment_windows")
-            )
-            moment_tokens = align_token_count(moment_tokens, med_tokens.shape[1])
-            fused_tokens, gate = self.fusion(med_tokens, moment_tokens)
-        else:
-            # Controlled MOMENT ablation: the Q-Former receives only the
-            # MedTsLLM token stream. The Q-Former, LLM, prompts, and output
-            # head remain unchanged.
-            fused_tokens = med_tokens
+        moment_tokens = self._encode_moment(
+            x_enc, inputs.get("x_moment_windows")
+        )
+        moment_tokens = align_token_count(moment_tokens, med_tokens.shape[1])
+        fused_tokens, gate = self.fusion(med_tokens, moment_tokens)
 
         queries, cross_attention = self.qformer(fused_tokens)
         soft_queries = self.q_to_llm(queries)
@@ -318,38 +275,25 @@ class TriMedTsLLM(MedTsLLM):
         llm_query_tokens = self._run_llm(prompt_tokens, soft_queries)
         sample_repr = self.llm_pool(llm_query_tokens)
 
+        if self._bc_prototypes is None:
+            self._build_class_prototypes()
+        prototypes = self._bc_prototypes.to(sample_repr.device)
         labels = inputs.get("labels") if self.training else None
-
-        if self.use_biomedcoop:
-            if self._bc_prototypes is None:
-                self._build_class_prototypes()
-            prototypes = self._bc_prototypes.to(sample_repr.device)
-            proto_logits = self.bc_head(sample_repr, prototypes, labels=labels)
-
-            # medtsllm4's binary task uses BCEWithLogitsLoss and expects one score.
-            logits = (
-                proto_logits
-                if self.n_classes > 2
-                else proto_logits[:, 1] - proto_logits[:, 0]
-            )
-        else:
-            if self.standard_classifier is None:
-                raise RuntimeError("Standard classifier was not initialized.")
-            logits = self.standard_classifier(sample_repr)
-            if self.n_classes <= 2:
-                logits = logits.squeeze(-1)
+        proto_logits = self.bc_head(sample_repr, prototypes, labels=labels)
+        # medtsllm4's binary task uses BCEWithLogitsLoss and expects one score.
+        logits = (
+            proto_logits
+            if self.n_classes > 2
+            else proto_logits[:, 1] - proto_logits[:, 0]
+        )
 
         med_repr = self.med_pool(med_tokens)
-        moment_repr = (
-            self.moment_pool(moment_tokens)
-            if moment_tokens is not None
-            else None
-        )
+        moment_repr = self.moment_pool(moment_tokens)
         query_repr = self.query_pool(queries)
         self._set_auxiliary_losses(
             med_repr, moment_repr, query_repr, queries, labels
         )
-        self.last_fusion_gate = gate.detach() if gate is not None else None
+        self.last_fusion_gate = gate.detach()
         self.last_cross_attention = [item.detach() for item in cross_attention]
         return logits
 
@@ -363,8 +307,7 @@ class TriMedTsLLM(MedTsLLM):
         super().train(mode)
         if self.llm_enabled and not self.lora_enabled:
             self.llm.eval()
-        if self.moment_encoder is not None:
-            self.moment_encoder.train(mode)
+        self.moment_encoder.train(mode)
         return self
 
     def state_dict(self) -> OrderedDict[str, Tensor]:
