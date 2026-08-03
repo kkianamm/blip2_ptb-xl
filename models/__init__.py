@@ -1,4 +1,5 @@
 from .medtsllm import MedTsLLM
+from .tri_medtsllm import TriMedTsLLM
 from .gpt4ts import GPT4TS
 
 from .dlinear import DLinear
@@ -8,9 +9,10 @@ from .TimesNet import TimesNet
 
 
 model_lookup = {
-	"timellm": MedTsLLM,
+    "timellm": MedTsLLM,
     "medtsllm": MedTsLLM,
-	"gpt4ts": GPT4TS,
+    "tri_medtsllm": TriMedTsLLM,
+    "gpt4ts": GPT4TS,
     "dlinear": DLinear,
     "fedformer": FEDformer,
     "patchtst": PatchTST,
