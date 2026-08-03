@@ -1,28 +1,58 @@
-# MedTsLLM: Leveraging LLMs for Multimodal Medical Time Series Analysis
+# PTB-XL ablation files
 
-Our paper has been published at MLHC 2024! [MedTsLLM: Leveraging LLMs for Multimodal Medical Time Series Analysis](https://arxiv.org/abs/2408.07773)
-Nimeesha Chan, Felix Parker, William Bennett, Tianyi Wu, Mung Yao Jia, James Fackler, Kimia Ghobadi
+These files patch the current `medtsllm-biomedcoop` combined model so MOMENT and
+BioMedCoOp can be disabled independently without removing the BLIP-2-style
+Q-Former.
 
+## Install
 
-## Instructions
+From the repository root:
 
-**Run with:**
-```
-python3 train.py configs/config_default.toml
-```
-
-
-### Setup
-
-### Datasets
-Create folder `data/` and add any datasets.
-Code for dataset processing is coming soon!
-
-### Python Environment
-Then run these commands to set up the correct environment:
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-pip install -r recommended.txt # optional but highly recommended
+cp /path/to/medtsllm_ablation_files/models/tri_medtsllm.py models/tri_medtsllm.py
+cp /path/to/medtsllm_ablation_files/configs/*.toml configs/
 ```
+
+Back up your original `models/tri_medtsllm.py` first.
+
+## Experiments
+
+Full model (existing config):
+
+```bash
+RUN_ID="ptbxl_full_seed0"
+python3 -u train.py configs/combined_ptbxl_full.toml "$RUN_ID" \
+  2>&1 | tee "outputs/console/${RUN_ID}.log"
+```
+
+Without MOMENT:
+
+```bash
+RUN_ID="ptbxl_no_moment_seed0"
+python3 -u train.py configs/combined_ptbxl_no_moment.toml "$RUN_ID" \
+  2>&1 | tee "outputs/console/${RUN_ID}.log"
+```
+
+Without BioMedCoOp:
+
+```bash
+RUN_ID="ptbxl_no_biomedcoop_seed0"
+python3 -u train.py configs/combined_ptbxl_no_biomedcoop.toml "$RUN_ID" \
+  2>&1 | tee "outputs/console/${RUN_ID}.log"
+```
+
+Without MOMENT and BioMedCoOp:
+
+```bash
+RUN_ID="ptbxl_no_moment_no_biomedcoop_seed0"
+python3 -u train.py configs/combined_ptbxl_no_moment_no_biomedcoop.toml "$RUN_ID" \
+  2>&1 | tee "outputs/console/${RUN_ID}.log"
+```
+
+## What remains fixed
+
+All ablations keep the MedTsLLM time-series encoder, task/data prompts,
+BLIP-2-style Q-Former, Llama backbone, training hyperparameters, and PTB-XL split.
+When BioMedCoOp is disabled, a trainable linear classifier is applied to the
+same pooled LLM representation. When MOMENT is disabled, the Q-Former receives
+only MedTsLLM tokens.
