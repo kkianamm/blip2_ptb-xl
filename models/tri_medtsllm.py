@@ -50,11 +50,7 @@ class TriMedTsLLM(MedTsLLM):
             raise ValueError(
                 "Missing [models.medtsllm.combined] in the TOML configuration."
             )
-        if not self.use_biomedcoop or not hasattr(self, "bc_head"):
-            raise ValueError(
-                "TriMedTsLLM requires the BioMedCoOp head already implemented in "
-                "medtsllm4. Enable [models.medtsllm.biomedcoop].enabled."
-            )
+    
         if not self.llm_enabled:
             raise ValueError("TriMedTsLLM requires models.medtsllm.llm.enabled=true.")
 
